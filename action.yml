@@ -1,186 +1,346 @@
-name: Discover Python dependents
-description: Find every repository in an org that depends on a Python package, and resolve the version to roll out to them.
+name: Bump a Python dependent
+description: Raise or refresh an upgrade pull request in one repository that depends on a Python package.
 
-# The first half of the publisher-side fan-out. Pair it with the `bump` sub-action, which takes one repository from the `repositories` output and raises the upgrade PR:
+# Deliberately mechanical: it moves the version specifier and relocks. A release that changes
+# the API still needs a human to migrate the call sites — the PR is the starting point for that
+# work, not a substitute for it.
+#
+# Run one instance per repository from a matrix built out of the `repositories` output of
+# CVector-Energy/python-discover-dependents, which finds the repositories worth bumping:
 #
 #   jobs:
 #     discover:
 #       outputs:
 #         version: ${{ steps.d.outputs.version }}
 #         repositories: ${{ steps.d.outputs.repositories }}
+#         has-dependents: ${{ steps.d.outputs.has-dependents }}
 #       steps:
-#         - uses: CVector-Energy/python-bump-dependents@v1
+#         - uses: CVector-Energy/python-discover-dependents@v1
 #           id: d
 #     bump:
 #       needs: discover
 #       if: needs.discover.outputs.has-dependents == 'true'
 #       strategy:
+#         fail-fast: false
 #         matrix:
 #           repository: ${{ fromJSON(needs.discover.outputs.repositories) }}
 #       steps:
-#         - uses: CVector-Energy/python-bump-dependents/bump@v1
+#         - uses: CVector-Energy/python-bump-dependents@v1
 
 inputs:
   package:
-    description: The package name as it appears in dependents' pyproject.toml.
+    description: The package name as it appears in the dependent's pyproject.toml.
+    required: true
+  repository:
+    description: Bare name of the dependent repository to bump.
+    required: true
+  version:
+    description: Version to roll out, without a leading `v`.
     required: true
   app-id:
-    description: >-
-      Client ID of a GitHub App installed org-wide. Code search spans the org, and naming the
-      dependent repositories in the workflow is the hard-coded list this action exists to
-      avoid, so discovery needs an unscoped read. The write-capable tokens are minted per
-      consumer by the bump action, scoped to one repository each.
+    description: Client ID of a GitHub App installed on the dependent repository.
     required: true
   app-private-key:
     description: Private key of that GitHub App.
     required: true
   owner:
-    description: Org to search. Defaults to the calling repository's owner.
+    description: Org that owns the dependent. Defaults to the calling repository's owner.
     required: false
     default: ${{ github.repository_owner }}
-  self:
-    description: Repository name to exclude from the results — the publisher's own. Defaults to the calling repository.
-    required: false
-    default: ${{ github.event.repository.name }}
-  version:
-    description: Version to roll out. Defaults to the tag of the release that triggered the workflow, with any leading `v` stripped.
-    required: false
-    default: ""
-  repositories:
-    description: Space-separated repository names to bump instead of the discovered set (an owner/ prefix is stripped). For re-running a single consumer.
-    required: false
-    default: ""
-  allow-empty:
+  branch:
     description: >-
-      Treat "no dependents found" as a clean no-op rather than an error. Default false,
-      because a search that silently returns nothing — a token that lost its scope, an index
-      that has not caught up — otherwise looks exactly like a run that bumped everything.
-      Set true for a package that is published before anything consumes it.
-    required: false
-    default: "false"
-  wait-command:
-    description: >-
-      Optional shell snippet polled until it exits zero, to hold until the new version is
-      actually installable. Runs with PACKAGE and VERSION in the environment. Publishing
-      usually runs off the same release event, so discovery can start before the artifact is
-      on the index; waiting on the artifact rather than on the other workflow keeps a manual
-      re-run correct too.
+      Branch to raise the PR from. One stable name per consumer is what makes a second release
+      update the open PR instead of stacking a new one beside it. Defaults to `deps/<package>`.
     required: false
     default: ""
-  wait-attempts:
-    description: How many times to run wait-command before giving up.
+  committer-name:
+    description: Name for the bump commit.
     required: false
-    default: "30"
-  wait-interval:
-    description: Seconds between wait-command attempts.
+    default: github-actions[bot]
+  committer-email:
+    description: Email for the bump commit.
     required: false
-    default: "20"
+    default: 41898282+github-actions[bot]@users.noreply.github.com
+  reviewer:
+    description: >-
+      Login to request review from. Best-effort — a bot login, or one without access to the
+      dependent, is warned about rather than failing the run.
+    required: false
+    default: ""
+  labels:
+    description: Comma-separated labels to apply to the PR.
+    required: false
+    default: ""
+  pre-lock-command:
+    description: >-
+      Optional shell snippet run immediately before relocking, for registry credentials that
+      `uv lock` will need. Anything it appends to $GITHUB_ENV is visible to the relock step.
+      AWS credentials and the like should be configured by the caller before this action, since
+      a composite action cannot host another action's steps mid-sequence.
+    required: false
+    default: ""
+  setup-uv:
+    description: Install uv. Set false if the caller has already done so.
+    required: false
+    default: "true"
 
 outputs:
-  version:
-    description: The resolved version, without a leading `v`.
-    value: ${{ steps.version.outputs.version }}
-  repositories:
-    description: JSON array of bare repository names, ready for `fromJSON` in a matrix.
-    value: ${{ steps.discover.outputs.repositories }}
-  count:
-    description: How many dependents were found.
-    value: ${{ steps.discover.outputs.count }}
-  has-dependents:
-    description: '"true" when at least one dependent was found. Gate the bump job on this so an empty matrix does not fail the run.'
-    value: ${{ steps.discover.outputs.has-dependents }}
-  token:
-    description: The org-read GitHub App token, for callers that need to keep searching.
-    value: ${{ steps.app.outputs.token }}
+  relevant:
+    description: '"true" if the repository actually resolves the package in a uv.lock.'
+    value: ${{ steps.relevant.outputs.relevant }}
+  pushed:
+    description: '"true" if a commit was pushed to the bump branch.'
+    value: ${{ steps.push.outputs.did_push }}
+  pull-request-number:
+    description: Number of the PR that was opened or updated, empty if none.
+    value: ${{ steps.pr.outputs.number }}
 
 runs:
   using: composite
   steps:
     - name: Create GitHub App token
       id: app
-      uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0 # zizmor: ignore[github-app] org-wide read is required for discovery; see the app-id input
+      uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
       with:
         client-id: ${{ inputs.app-id }}
         private-key: ${{ inputs.app-private-key }}
         owner: ${{ inputs.owner }}
-        # Code search reads file contents, so metadata scope alone is not enough for it.
-        permission-contents: read
+        repositories: ${{ inputs.repository }}
+        permission-contents: write
+        permission-pull-requests: write
 
-    - name: Resolve version
-      id: version
+    - name: Resolve settings
+      id: cfg
       shell: bash
       env:
-        INPUT_VERSION: ${{ inputs.version }}
-        RELEASE_TAG: ${{ github.event.release.tag_name }}
-      run: |
-        set -euo pipefail
-        RAW="${INPUT_VERSION:-${RELEASE_TAG:-}}"
-        if [ -z "$RAW" ]; then
-          echo "::error::No version supplied and no release tag on the event."
-          exit 1
-        fi
-        # Publishers derive the wheel version from the tag by stripping `v`, so strip the same prefix here.
-        VERSION="${RAW#v}"
-        # The version becomes replacement text inside a TOML string, so a tag that is not version-shaped would write a broken pyproject.toml to every consumer. Permissive enough for PEP 440 local/dev builds (`0.7.2.dev1+g2f463d36e`), strict enough to exclude quotes and shell metacharacters.
-        if ! printf '%s' "$VERSION" | grep -Eq '^[0-9][A-Za-z0-9.+-]*$'; then
-          echo "::error::Refusing to roll out '${VERSION}': not a version string."
-          exit 1
-        fi
-        echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-
-    - name: Wait for the version to be installable
-      if: inputs.wait-command != ''
-      shell: bash
-      env:
+        BRANCH_INPUT: ${{ inputs.branch }}
         PACKAGE: ${{ inputs.package }}
-        VERSION: ${{ steps.version.outputs.version }}
-        WAIT_COMMAND: ${{ inputs.wait-command }}
-        ATTEMPTS: ${{ inputs.wait-attempts }}
-        INTERVAL: ${{ inputs.wait-interval }}
+        OWNER: ${{ inputs.owner }}
+        REPOSITORY: ${{ inputs.repository }}
       run: |
         set -euo pipefail
-        for _ in $(seq 1 "$ATTEMPTS"); do
-          if bash -c "$WAIT_COMMAND"; then
-            echo "$PACKAGE $VERSION is available."
-            exit 0
-          fi
-          sleep "$INTERVAL"
-        done
-        echo "::error::$PACKAGE $VERSION never became available; did the publish workflow fail?"
-        exit 1
+        echo "branch=${BRANCH_INPUT:-deps/${PACKAGE}}" >> "$GITHUB_OUTPUT"
+        echo "repo=${OWNER}/${REPOSITORY}" >> "$GITHUB_OUTPUT"
 
-    - name: Discover dependents
-      id: discover
+    - name: Checkout dependent
+      uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      with:
+        repository: ${{ steps.cfg.outputs.repo }}
+        token: ${{ steps.app.outputs.token }}
+        # Full history: the bump branch is fetched and extended below, and pushing a new commit on top of it from a shallow clone is not reliably allowed.
+        fetch-depth: 0
+        persist-credentials: false
+
+    # Continue an open bump branch rather than rebuilding it, so migration commits pushed onto the PR survive the next release. The cost is that the branch does not pick up the base as it moves — the same staleness any long-lived PR has, and the right trade against discarding somebody's work.
+    - name: Continue the existing bump branch if there is one
       shell: bash
       env:
         GH_TOKEN: ${{ steps.app.outputs.token }}
-        OWNER: ${{ inputs.owner }}
-        PACKAGE: ${{ inputs.package }}
-        SELF: ${{ inputs.self }}
-        OVERRIDE: ${{ inputs.repositories }}
-        ALLOW_EMPTY: ${{ inputs.allow-empty }}
+        REPO: ${{ steps.cfg.outputs.repo }}
+        BRANCH: ${{ steps.cfg.outputs.branch }}
       run: |
         set -euo pipefail
-        REPOS=$("${GITHUB_ACTION_PATH}/scripts/discover.sh" "$OWNER" "$PACKAGE" "$SELF" "$OVERRIDE")
-        COUNT=$(jq 'length' <<<"$REPOS")
-        echo "repositories=${REPOS}" >> "$GITHUB_OUTPUT"
-        echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
-        if [ "$COUNT" -eq 0 ]; then
-          echo "has-dependents=false" >> "$GITHUB_OUTPUT"
-          if [ "$ALLOW_EMPTY" != "true" ]; then
-            echo "::error::Found no dependents of ${PACKAGE}. Check that the app is installed org-wide, or pass the repositories input. Set allow-empty if this package genuinely has no consumers yet."
-            exit 1
-          fi
-          echo "::notice::No dependents of ${PACKAGE} found; nothing to bump."
-          echo "### No dependents of \`${PACKAGE}\`" >> "$GITHUB_STEP_SUMMARY"
+        REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+        if git ls-remote --exit-code --heads "$REMOTE" "$BRANCH" >/dev/null 2>&1; then
+          echo "Continuing the open ${BRANCH}."
+          git fetch "$REMOTE" "$BRANCH"
+          git checkout -B "$BRANCH" FETCH_HEAD
+        else
+          echo "No ${BRANCH} yet; starting from the default branch."
+          git checkout -B "$BRANCH"
+        fi
+
+    # Discovery matches text, so a pyproject.toml that only names the package in a comment can put a repository in the matrix. Deciding on the lockfiles instead of on the same text the search matched: uv writes a `name = "<package>"` line for every resolved package, direct or transitive, so this is the resolver's own answer to whether the repository depends on it.
+    - name: Check the repository really depends on the package
+      id: relevant
+      shell: bash
+      env:
+        PACKAGE: ${{ inputs.package }}
+      run: |
+        set -euo pipefail
+        # PEP 503 normalization: a lock may spell the name with either separator.
+        NORM=$(printf '%s' "$PACKAGE" | tr '_.' '--')
+        if grep -rqiE "name = \"${NORM//-/[-_.]}\"" --include=uv.lock .; then
+          echo "relevant=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "::notice::No ${PACKAGE} in any uv.lock; skipping."
+          echo "relevant=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    # Not gated on `relevant`: the rewrite is harmless either way, and gating it would only make
+    # the step graph harder to follow.
+    - name: Rewrite the version specifier
+      shell: bash
+      env:
+        PACKAGE: ${{ inputs.package }}
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        # Output into RUNNER_TEMP, not the working tree — this is the consumer's repository, and
+        # anything written here would be picked up by the commit below.
+        python3 "${GITHUB_ACTION_PATH}/scripts/rewrite_specifier.py" "$PACKAGE" "$VERSION" \
+          | tee "$RUNNER_TEMP/changed.txt"
+
+    - name: Install uv
+      if: steps.relevant.outputs.relevant == 'true' && inputs.setup-uv == 'true'
+      uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098 # v7.3.1
+      with:
+        # This job resolves against a registry and pushes the result, so a poisoned cache would
+        # land in a PR. Locking is metadata-only and fast; the cache is not worth that.
+        enable-cache: false
+
+    - name: Configure registry credentials
+      if: steps.relevant.outputs.relevant == 'true' && inputs.pre-lock-command != ''
+      shell: bash
+      env:
+        PACKAGE: ${{ inputs.package }}
+        PRE_LOCK_COMMAND: ${{ inputs.pre-lock-command }}
+      run: | # zizmor: ignore[github-env] the caller's snippet exports masked registry credentials that have to outlive this step for uv
+        set -euo pipefail
+        bash -c "$PRE_LOCK_COMMAND"
+
+    # Runs whether or not the specifier moved. An unconstrained `"<package>"` never matches the
+    # rewrite, but its lock still pins an old version — gating this on the rewrite left those
+    # repositories silently stale.
+    - name: Relock
+      id: relock
+      if: steps.relevant.outputs.relevant == 'true'
+      shell: bash
+      env:
+        PACKAGE: ${{ inputs.package }}
+      run: |
+        set -euo pipefail
+        {
+          echo "failed<<RELOCK_EOF"
+          "${GITHUB_ACTION_PATH}/scripts/relock.sh" "$PACKAGE"
+          echo "RELOCK_EOF"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Commit and push
+      id: push
+      if: steps.relevant.outputs.relevant == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.app.outputs.token }}
+        REPO: ${{ steps.cfg.outputs.repo }}
+        BRANCH: ${{ steps.cfg.outputs.branch }}
+        PACKAGE: ${{ inputs.package }}
+        VERSION: ${{ inputs.version }}
+        COMMITTER_NAME: ${{ inputs.committer-name }}
+        COMMITTER_EMAIL: ${{ inputs.committer-email }}
+      run: |
+        set -euo pipefail
+        git config user.name "$COMMITTER_NAME"
+        git config user.email "$COMMITTER_EMAIL"
+        # Explicit paths rather than `-A`: only manifests and locks are ever meant to move, and
+        # anything else in the tree is either the consumer's or this job's litter. `**/` also
+        # matches at the root, so this covers a single-project repo.
+        #
+        # Resolved through `ls-files` first because `git add` treats a pathspec that matches
+        # nothing as a fatal error — a consumer with no uv.lock would otherwise kill the leg
+        # here rather than report "nothing to do".
+        mapfile -t PATHS < <(
+          git ls-files -mo --exclude-standard \
+            -- ':(glob)**/pyproject.toml' ':(glob)**/uv.lock' ':(glob,exclude)**/.venv/**'
+        )
+        if [ ${#PATHS[@]} -gt 0 ]; then
+          git add -- "${PATHS[@]}"
+        fi
+        if git diff --cached --quiet; then
+          echo "Nothing changed; already on ${VERSION}."
+          echo "did_push=false" >> "$GITHUB_OUTPUT"
           exit 0
         fi
-        echo "has-dependents=true" >> "$GITHUB_OUTPUT"
-        {
-          echo "### Dependents discovered"
-          echo
-          jq -r --arg owner "$OWNER" '.[] | "- \($owner)/\(.)"' <<<"$REPOS"
-        } >> "$GITHUB_STEP_SUMMARY"
+        git commit -m "Upgrade to ${PACKAGE}@${VERSION}"
+        # A plain push, so a release appends to the branch instead of rewriting it. If somebody
+        # has pushed since the fetch above, this fails rather than discarding their commit.
+        git push "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "HEAD:refs/heads/${BRANCH}"
+        echo "did_push=true" >> "$GITHUB_OUTPUT"
+
+    - name: Open or update the PR
+      id: pr
+      if: steps.push.outputs.did_push == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.app.outputs.token }}
+        REPO: ${{ steps.cfg.outputs.repo }}
+        BRANCH: ${{ steps.cfg.outputs.branch }}
+        PACKAGE: ${{ inputs.package }}
+        VERSION: ${{ inputs.version }}
+        LABELS: ${{ inputs.labels }}
+        RELEASE_URL: ${{ github.event.release.html_url }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        RELOCK_FAILED: ${{ steps.relock.outputs.failed }}
+        REVIEWER: ${{ inputs.reviewer }}
+      run: |
+        set -euo pipefail
+        BASE=$(gh repo view "$REPO" --json defaultBranchRef --jq '.defaultBranchRef.name')
+        TITLE="Upgrade to ${PACKAGE}@${VERSION}"
+        WARNING=""
+        if [ -n "${RELOCK_FAILED//[[:space:]]/}" ]; then
+          LIST=$(printf '%s\n' "$RELOCK_FAILED" | sed '/^[[:space:]]*$/d;s/^/> - `/;s/$/`/')
+          WARNING=$(printf '\n> [!WARNING]\n> `uv lock` failed in these projects, so their lockfiles are **not** updated here and will need relocking by hand:\n>\n%s' "$LIST")
+          # Command substitution strips trailing newlines, so the blank line that keeps the next
+          # paragraph out of the blockquote — Markdown would swallow it by lazy continuation —
+          # has to be appended after the fact.
+          WARNING="${WARNING}"$'\n'
+        fi
+        BODY=$(cat <<EOF
+        Raised by [this workflow run](${RUN_URL}) from the ${PACKAGE} \`${VERSION}\` release${RELEASE_URL:+ ([release notes](${RELEASE_URL}))}.
+
+        The version specifier moved and every affected \`uv.lock\` was relocked with \`--upgrade-package ${PACKAGE}\`, so the diff should carry that one package.
+        ${WARNING}
+        **This PR is mechanical.** If \`${VERSION}\` changed or removed API this repository uses, the call sites still need migrating by hand — check this repo's CI below before merging.
+
+        A later release appends another commit to this branch rather than rewriting it, so an unmerged PR is carried forward and any migration work committed here is kept. The branch does not follow \`${BASE}\` as it moves — rebase or merge it as you would any other PR.
+        EOF
+        )
+        EXISTING=$(gh pr list --repo "$REPO" --head "$BRANCH" --base "$BASE" --state open --json number --jq '.[0].number // empty')
+        if [ -z "$EXISTING" ]; then
+          gh pr create --repo "$REPO" --base "$BASE" --head "$BRANCH" --title "$TITLE" --body "$BODY"
+          EXISTING=$(gh pr list --repo "$REPO" --head "$BRANCH" --base "$BASE" --state open --json number --jq '.[0].number // empty')
+        else
+          gh pr edit "$EXISTING" --repo "$REPO" --title "$TITLE" --body "$BODY"
+        fi
+        echo "number=${EXISTING}" >> "$GITHUB_OUTPUT"
+        if [ -n "$LABELS" ]; then
+          gh pr edit "$EXISTING" --repo "$REPO" --add-label "$LABELS" \
+            || echo "::warning::Could not label ${REPO}#${EXISTING}."
+        fi
+        # Best-effort: fails if the reviewer is a bot, lacks access to this repository, or is
+        # already requested. None of that is worth losing the PR over.
+        if [ -n "$REVIEWER" ] && ! gh pr edit "$EXISTING" --repo "$REPO" --add-reviewer "$REVIEWER"; then
+          echo "::warning::Could not request review from ${REVIEWER} on ${REPO}#${EXISTING}."
+        fi
+
+    # Raising the PR is where this action stops. Whether the release actually works for a
+    # consumer is that repository's own CI to answer, on its own PR.
+    #
+    # Each outcome is reported from what actually happened rather than inferred from the absence
+    # of a push: a leg that died in the relock reaches this step and must not report "already up
+    # to date".
+    - name: Summarise
+      if: always()
+      shell: bash
+      env:
+        REPO: ${{ steps.cfg.outputs.repo }}
+        PACKAGE: ${{ inputs.package }}
+        PR: ${{ steps.pr.outputs.number }}
+        PUSHED: ${{ steps.push.outputs.did_push }}
+        RELEVANT: ${{ steps.relevant.outputs.relevant }}
+        STATUS: ${{ job.status }}
+      run: |
+        set -euo pipefail
+        if [ "$STATUS" != "success" ]; then
+          LINE="did not finish — see the job log"
+        elif [ "$PUSHED" = "true" ]; then
+          LINE="[PR #${PR}](https://github.com/${REPO}/pull/${PR})"
+        elif [ "$RELEVANT" != "true" ]; then
+          LINE="no ${PACKAGE} dependency (matched the search on a comment)"
+        else
+          LINE="already up to date"
+        fi
+        echo "- **${REPO}** — ${LINE}" >> "$GITHUB_STEP_SUMMARY"
 
 branding:
   icon: git-pull-request

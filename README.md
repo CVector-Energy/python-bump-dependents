@@ -1,15 +1,16 @@
 # python-bump-dependents
 
-Publisher-side dependency fan-out. When you release a Python package, this raises (or
-refreshes) an upgrade pull request in every repository in your org that depends on it — so a
-release reaches its consumers without anyone opening five PRs by hand.
+Raises (or refreshes) an upgrade pull request in one repository that depends on a Python
+package: it moves the version specifier, relocks, and opens or updates the PR.
+
+This is the second half of a publisher-side dependency fan-out. Pair it with
+[`python-discover-dependents`](https://github.com/CVector-Energy/python-discover-dependents),
+which finds the repositories worth bumping — so a release reaches its consumers without anyone
+opening five PRs by hand.
 
 It is deliberately mechanical: it moves the version specifier and relocks. A release that
 changes the API still needs a human to migrate the call sites. The PR is the starting point
 for that work, not a substitute for it.
-
-Consumers are **discovered**, not listed. Avoiding a hard-coded list of dependents in the
-publisher's workflow is the whole point.
 
 ## Why not Dependabot, Renovate, or create-pull-request?
 
@@ -56,7 +57,7 @@ jobs:
       repositories: ${{ steps.discover.outputs.repositories }}
       has-dependents: ${{ steps.discover.outputs.has-dependents }}
     steps:
-      - uses: CVector-Energy/python-bump-dependents@v1
+      - uses: CVector-Energy/python-discover-dependents@v1
         id: discover
         with:
           package: my-package
@@ -73,7 +74,7 @@ jobs:
       matrix:
         repository: ${{ fromJSON(needs.discover.outputs.repositories) }}
     steps:
-      - uses: CVector-Energy/python-bump-dependents/bump@v1
+      - uses: CVector-Energy/python-bump-dependents@v1
         with:
           package: my-package
           repository: ${{ matrix.repository }}
@@ -103,7 +104,7 @@ steps mid-sequence.
         with:
           role-to-assume: arn:aws:iam::000000000000:role/MyPackage-Bump
           aws-region: us-east-1
-      - uses: CVector-Energy/python-bump-dependents@v1
+      - uses: CVector-Energy/python-discover-dependents@v1
         id: discover
         with:
           package: my-package
@@ -117,7 +118,7 @@ steps mid-sequence.
 ```
 
 ```yaml
-      - uses: CVector-Energy/python-bump-dependents/bump@v1
+      - uses: CVector-Energy/python-bump-dependents@v1
         with:
           # ...
           pre-lock-command: |
@@ -135,30 +136,9 @@ statically — which runs third-party code in the same job that holds the regist
 
 ## Inputs
 
-### `CVector-Energy/python-bump-dependents` (discover)
-
 | Input | Required | Default | Description |
 | --- | --- | --- | --- |
-| `package` | yes | | Package name as it appears in dependents' `pyproject.toml`. |
-| `app-id` | yes | | Client ID of a GitHub App installed org-wide. |
-| `app-private-key` | yes | | Private key of that app. |
-| `owner` | no | calling repo's owner | Org to search. |
-| `self` | no | calling repo | Repository name to exclude from results. |
-| `version` | no | the release tag, `v` stripped | Version to roll out. |
-| `repositories` | no | | Space-separated names to bump instead of searching. |
-| `allow-empty` | no | `false` | Treat "no dependents" as a no-op instead of an error. |
-| `wait-command` | no | | Shell snippet polled until the version is installable. |
-| `wait-attempts` | no | `30` | Attempts before giving up. |
-| `wait-interval` | no | `20` | Seconds between attempts. |
-
-Outputs: `version`, `repositories` (JSON array for `fromJSON`), `count`, `has-dependents`,
-`token`.
-
-### `CVector-Energy/python-bump-dependents/bump`
-
-| Input | Required | Default | Description |
-| --- | --- | --- | --- |
-| `package` | yes | | Package name. |
+| `package` | yes | | Package name as it appears in the dependent's `pyproject.toml`. |
 | `repository` | yes | | Bare name of the dependent to bump. |
 | `version` | yes | | Version to roll out, no leading `v`. |
 | `app-id` | yes | | Client ID of a GitHub App installed on the dependent. |
@@ -172,21 +152,20 @@ Outputs: `version`, `repositories` (JSON array for `fromJSON`), `count`, `has-de
 | `pre-lock-command` | no | | Shell snippet run before `uv lock`. |
 | `setup-uv` | no | `true` | Install uv. |
 
-Outputs: `relevant`, `pushed`, `pull-request-number`.
+## Outputs
+
+| Output | Description |
+| --- | --- |
+| `relevant` | `"true"` if the repository actually resolves the package in a `uv.lock`. |
+| `pushed` | `"true"` if a commit was pushed to the bump branch. |
+| `pull-request-number` | Number of the PR opened or updated, empty if none. |
 
 ## Behaviour worth knowing
 
-**Discovery is a text search.** GitHub code search indexes default branches only, which is
-exactly the set worth bumping, but it matches text — a `pyproject.toml` that names the package
-in a comment can land in the matrix. The bump step then checks `uv.lock` for a resolved
-`name = "<package>"` entry and skips the repository if it isn't there. That is the resolver's
-own answer to whether the repository depends on the package, rather than the same text the
-search matched.
-
-**Zero dependents is an error by default.** A search that silently returns nothing — an app
-that lost its org installation, an index that hasn't caught up — otherwise looks exactly like
-a run that bumped everything. Set `allow-empty: true` for a package published before anything
-consumes it.
+**A repository that does not really depend on the package is skipped.** Discovery matches
+text, so a `pyproject.toml` naming the package in a comment can land in the matrix. This action
+checks `uv.lock` for a resolved `name = "<package>"` entry first and reports `relevant: false`
+if it isn't there — the resolver's own answer, rather than the same text the search matched.
 
 **Unconstrained dependencies are left alone.** A bare `"my-package"` already resolves to the
 newest release; pinning it would be a policy change nobody asked for. The relock still runs
@@ -217,6 +196,43 @@ shellcheck scripts/*.sh
 The logic that would be painful to debug from a failed fan-out lives in `scripts/` and is
 tested directly: `rewrite_specifier.py` (which specifiers move and which don't) and
 `relock.sh` (the failure policy, driven through a stub `uv`).
+
+## Related projects
+
+- [`python-discover-dependents`](https://github.com/CVector-Energy/python-discover-dependents) —
+  the other half: finds the repositories in your org that depend on the package and resolves the
+  version to roll out. Its `repositories` output is the matrix this action runs over.
+
+The rest of the Python release pipeline these actions are built for:
+
+- [`publish-to-codeartifact`](https://github.com/CVector-Energy/publish-to-codeartifact) —
+  builds and publishes the wheel to AWS CodeArtifact. Its direct counterpart: that action puts
+  a release on the index, this one rolls it out to the repositories that depend on it.
+- [`pyproject-license-check`](https://github.com/CVector-Energy/pyproject-license-check) —
+  audits a project's resolved dependencies for license compliance.
+- [`python-test`](https://github.com/CVector-Energy/python-test) — runs ruff, mypy and pytest
+  for a Python repository. Worth having on the consumers, since it is their own CI that
+  answers whether an upgrade PR from here is safe to merge.
+- [`aws-ga-deployment-role`](https://github.com/CVector-Energy/aws-ga-deployment-role) —
+  Terraform module for the GitHub OIDC role the `wait-command` and `pre-lock-command` examples
+  above assume.
+
+Built on:
+
+- [`actions/create-github-app-token`](https://github.com/actions/create-github-app-token) —
+  mints the org-read token for discovery and the per-repository write tokens for the bumps.
+- [`astral-sh/setup-uv`](https://github.com/astral-sh/setup-uv) and
+  [uv](https://github.com/astral-sh/uv) — the resolver behind the relock.
+
+Alternatives worth considering before this one — see
+[Why not Dependabot, Renovate, or create-pull-request?](#why-not-dependabot-renovate-or-create-pull-request)
+for when each is the better fit:
+
+- [Dependabot](https://docs.github.com/en/code-security/dependabot) and
+  [Renovate](https://github.com/renovatebot/renovate) — consumer-side pollers.
+- [`peter-evans/create-pull-request`](https://github.com/peter-evans/create-pull-request) — the
+  general-purpose way to raise a PR from a workflow, if you do not need the append-only branch
+  behaviour.
 
 ## License
 
