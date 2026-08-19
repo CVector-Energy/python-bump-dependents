@@ -1,12 +1,9 @@
 name: Bump a Python dependent
 description: Raise or refresh an upgrade pull request in one repository that depends on a Python package.
 
-# Deliberately mechanical: it moves the version specifier and relocks. A release that changes
-# the API still needs a human to migrate the call sites — the PR is the starting point for that
-# work, not a substitute for it.
+# Moves the version specifier and relocks.
 #
-# Run one instance per repository from a matrix built out of the root action's `repositories`
-# output. See that action's usage comment.
+# Run one instance per repository from a matrix built out of the root action's `repositories` output. See that action's usage comment.
 
 inputs:
   package:
@@ -108,16 +105,11 @@ runs:
       with:
         repository: ${{ steps.cfg.outputs.repo }}
         token: ${{ steps.app.outputs.token }}
-        # Full history: the bump branch is fetched and extended below, and pushing a new commit
-        # on top of it from a shallow clone is not reliably allowed.
+        # Full history: the bump branch is fetched and extended below, and pushing a new commit on top of it from a shallow clone is not reliably allowed.
         fetch-depth: 0
         persist-credentials: false
 
-    # Continue an open bump branch rather than rebuilding it, so migration commits pushed onto
-    # the PR survive the next release. The cost is that the branch does not pick up the base as
-    # it moves — the same staleness any long-lived PR has, and the right trade against
-    # discarding somebody's work. This is why the action does not delegate to
-    # peter-evans/create-pull-request, which resets the branch onto the base and force-pushes.
+    # Continue an open bump branch rather than rebuilding it, so migration commits pushed onto the PR survive the next release. The cost is that the branch does not pick up the base as it moves — the same staleness any long-lived PR has, and the right trade against discarding somebody's work.
     - name: Continue the existing bump branch if there is one
       shell: bash
       env:
@@ -136,11 +128,7 @@ runs:
           git checkout -B "$BRANCH"
         fi
 
-    # Discovery matches text, so a pyproject.toml that only names the package in a comment can
-    # put a repository in the matrix. Deciding on the lockfiles instead of on the same text the
-    # search matched: uv writes a `name = "<package>"` line for every resolved package, direct
-    # or transitive, so this is the resolver's own answer to whether the repository depends on
-    # it.
+    # Discovery matches text, so a pyproject.toml that only names the package in a comment can put a repository in the matrix. Deciding on the lockfiles instead of on the same text the search matched: uv writes a `name = "<package>"` line for every resolved package, direct or transitive, so this is the resolver's own answer to whether the repository depends on it.
     - name: Check the repository really depends on the package
       id: relevant
       shell: bash

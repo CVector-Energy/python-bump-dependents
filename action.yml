@@ -1,8 +1,7 @@
 name: Discover Python dependents
 description: Find every repository in an org that depends on a Python package, and resolve the version to roll out to them.
 
-# The first half of the publisher-side fan-out. Pair it with the `bump` sub-action, which
-# takes one repository from the `repositories` output and raises the upgrade PR:
+# The first half of the publisher-side fan-out. Pair it with the `bump` sub-action, which takes one repository from the `repositories` output and raises the upgrade PR:
 #
 #   jobs:
 #     discover:
@@ -120,13 +119,9 @@ runs:
           echo "::error::No version supplied and no release tag on the event."
           exit 1
         fi
-        # Publishers derive the wheel version from the tag by stripping `v`, so strip the same
-        # prefix here.
+        # Publishers derive the wheel version from the tag by stripping `v`, so strip the same prefix here.
         VERSION="${RAW#v}"
-        # The version becomes replacement text inside a TOML string, so a tag that is not
-        # version-shaped would write a broken pyproject.toml to every consumer. Permissive
-        # enough for PEP 440 local/dev builds (`0.7.2.dev1+g2f463d36e`), strict enough to
-        # exclude quotes and shell metacharacters.
+        # The version becomes replacement text inside a TOML string, so a tag that is not version-shaped would write a broken pyproject.toml to every consumer. Permissive enough for PEP 440 local/dev builds (`0.7.2.dev1+g2f463d36e`), strict enough to exclude quotes and shell metacharacters.
         if ! printf '%s' "$VERSION" | grep -Eq '^[0-9][A-Za-z0-9.+-]*$'; then
           echo "::error::Refusing to roll out '${VERSION}': not a version string."
           exit 1
